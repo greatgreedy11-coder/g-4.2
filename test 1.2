@@ -1,0 +1,469 @@
+import json
+import random
+import sys
+from pathlib import Path
+
+import pygame
+
+pygame.init()
+
+WIDTH, HEIGHT = 900, 650
+GROUND_HEIGHT = 115
+FPS = 60
+
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Flappy Bird - Coins and Skins")
+clock = pygame.time.Clock()
+
+ASSET_DIR = Path(__file__).with_name("assets_hd")
+SAVE_FILE = ASSET_DIR / "save_data.json"
+CUSTOM_SKIN = ASSET_DIR / "custom_skin.png"
+
+WHITE = (255, 255, 255)
+BLACK = (24, 28, 34)
+SKY = (91, 206, 232)
+SKY_2 = (158, 236, 244)
+GRASS = (88, 203, 76)
+DIRT = (212, 164, 92)
+PIPE = (85, 190, 90)
+PIPE_DARK = (45, 128, 61)
+GOLD = (255, 211, 50)
+GOLD_DARK = (196, 130, 24)
+RED = (224, 72, 74)
+
+title_font = pygame.font.SysFont("impact", 56)
+big_font = pygame.font.SysFont("arial", 34, bold=True)
+font = pygame.font.SysFont("arial", 24, bold=True)
+small_font = pygame.font.SysFont("arial", 18, bold=True)
+
+MENU = "menu"
+RUNNING = "running"
+GAME_OVER = "game_over"
+SHOP = "shop"
+
+BIRD_X = 135
+BIRD_W, BIRD_H = 44, 34
+GRAVITY = 0.5
+FLAP_FORCE = -9.2
+
+PIPE_WIDTH = 70
+PIPE_GAP = 170
+PIPE_DISTANCE = 260
+PIPE_SPEED_START = 4
+
+SKINS = [
+    {"name": "Classic", "price": 0, "body": (255, 232, 83), "wing": (238, 162, 38), "beak": (255, 144, 52)},
+    {"name": "Berry", "price": 8, "body": (255, 106, 130), "wing": (191, 74, 126), "beak": (255, 190, 64)},
+    {"name": "Sky", "price": 12, "body": (94, 205, 255), "wing": (45, 132, 220), "beak": (255, 218, 75)},
+    {"name": "Lime", "price": 16, "body": (136, 235, 86), "wing": (47, 166, 80), "beak": (255, 156, 48)},
+    {"name": "Royal", "price": 24, "body": (180, 118, 255), "wing": (97, 72, 190), "beak": (255, 214, 67)},
+]
+
+skin_cache = {}
+
+
+def load_save():
+    ASSET_DIR.mkdir(exist_ok=True)
+
+    if CUSTOM_SKIN.exists() and not any(s["name"] == "Imported" for s in SKINS):
+        SKINS.append({"name": "Imported", "price": 0, "image": CUSTOM_SKIN})
+
+    if not SAVE_FILE.exists():
+        return 0, 0, {0}
+
+    try:
+        data = json.loads(SAVE_FILE.read_text())
+        coins = int(data.get("coins", 0))
+        selected = int(data.get("selected", 0))
+        unlocked = {int(x) for x in data.get("unlocked", [0])}
+    except Exception:
+        return 0, 0, {0}
+
+    unlocked.add(0)
+    unlocked = {x for x in unlocked if 0 <= x < len(SKINS)}
+
+    if selected not in unlocked:
+        selected = 0
+
+    return max(0, coins), selected, unlocked
+
+
+def save_game():
+    ASSET_DIR.mkdir(exist_ok=True)
+    data = {
+        "coins": total_coins,
+        "selected": selected_skin,
+        "unlocked": sorted(unlocked_skins),
+    }
+    SAVE_FILE.write_text(json.dumps(data, indent=2))
+
+
+def create_skin_surface(index, size=(64, 48)):
+    skin = SKINS[index]
+
+    if "image" in skin:
+        try:
+            image = pygame.image.load(str(skin["image"])).convert_alpha()
+            return pygame.transform.smoothscale(image, size)
+        except pygame.error:
+            skin = SKINS[0]
+
+    surface = pygame.Surface((144, 108), pygame.SRCALPHA)
+    body = skin["body"]
+    wing = skin["wing"]
+    beak = skin["beak"]
+
+    pygame.draw.ellipse(surface, (0, 0, 0, 55), (18, 34, 91, 54))
+    pygame.draw.ellipse(surface, body, (18, 22, 88, 62))
+    pygame.draw.ellipse(surface, tuple(min(255, c + 35) for c in body), (36, 30, 50, 28))
+    pygame.draw.ellipse(surface, wing, (20, 50, 55, 34))
+    pygame.draw.polygon(surface, beak, [(100, 50), (136, 35), (132, 66)])
+    pygame.draw.polygon(surface, (220, 88, 38), [(101, 52), (133, 52), (132, 66)])
+    pygame.draw.circle(surface, WHITE, (88, 38), 13)
+    pygame.draw.circle(surface, BLACK, (93, 38), 6)
+    pygame.draw.circle(surface, WHITE, (95, 35), 2)
+
+    return pygame.transform.smoothscale(surface, size)
+
+
+def get_skin(index, size=(64, 48)):
+    key = (index, size)
+    if key not in skin_cache:
+        skin_cache[key] = create_skin_surface(index, size)
+    return skin_cache[key]
+
+
+def import_custom_skin():
+    global selected_skin, preview_skin
+
+    if not CUSTOM_SKIN.exists():
+        return
+
+    existing = next((i for i, s in enumerate(SKINS) if s["name"] == "Imported"), None)
+
+    if existing is None:
+        SKINS.append({"name": "Imported", "price": 0, "image": CUSTOM_SKIN})
+        existing = len(SKINS) - 1
+
+    skin_cache.clear()
+    unlocked_skins.add(existing)
+    selected_skin = existing
+    preview_skin = existing
+    save_game()
+
+
+def create_pipe(x):
+    top_h = random.randint(70, HEIGHT - GROUND_HEIGHT - PIPE_GAP - 80)
+    coin_rect = pygame.Rect(x + PIPE_WIDTH + 75, top_h + PIPE_GAP // 2 - 17, 34, 34)
+
+    return {
+        "top": pygame.Rect(x, 0, PIPE_WIDTH, top_h),
+        "bottom": pygame.Rect(x, top_h + PIPE_GAP, PIPE_WIDTH, HEIGHT - GROUND_HEIGHT - top_h - PIPE_GAP),
+        "coin": coin_rect,
+        "coin_collected": False,
+        "scored": False,
+    }
+
+
+def fresh_pipes():
+    return [create_pipe(WIDTH + i * PIPE_DISTANCE) for i in range(5)]
+
+
+def new_game():
+    return {
+        "state": RUNNING,
+        "bird_y": HEIGHT // 2,
+        "velocity": 0,
+        "score": 0,
+        "coins": 0,
+        "speed": PIPE_SPEED_START,
+        "pipes": fresh_pipes(),
+    }
+
+
+def menu_game():
+    return {
+        "state": MENU,
+        "bird_y": HEIGHT // 2,
+        "velocity": 0,
+        "score": 0,
+        "coins": 0,
+        "speed": PIPE_SPEED_START,
+        "pipes": fresh_pipes(),
+    }
+
+
+def bird_rect():
+    return pygame.Rect(BIRD_X, int(game["bird_y"]), BIRD_W, BIRD_H)
+
+
+def flap_input(event):
+    return (
+        event.type == pygame.MOUSEBUTTONDOWN
+        or event.type == pygame.KEYDOWN and event.key in (pygame.K_SPACE, pygame.K_UP)
+    )
+
+
+def draw_background(scroll):
+    for y in range(HEIGHT):
+        t = y / HEIGHT
+        color = (
+            int(SKY[0] * (1 - t) + SKY_2[0] * t),
+            int(SKY[1] * (1 - t) + SKY_2[1] * t),
+            int(SKY[2] * (1 - t) + SKY_2[2] * t),
+        )
+        pygame.draw.line(screen, color, (0, y), (WIDTH, y))
+
+    for x in range(-100, WIDTH + 160, 170):
+        cx = x - int(scroll * 0.25) % 170
+        pygame.draw.circle(screen, (240, 255, 255), (cx, 115), 34)
+        pygame.draw.circle(screen, (240, 255, 255), (cx + 38, 96), 42)
+        pygame.draw.circle(screen, (240, 255, 255), (cx + 82, 116), 34)
+        pygame.draw.rect(screen, (240, 255, 255), (cx, 115, 85, 30))
+
+    ground_y = HEIGHT - GROUND_HEIGHT
+    pygame.draw.rect(screen, GRASS, (0, ground_y, WIDTH, 34))
+    pygame.draw.rect(screen, (129, 231, 85), (0, ground_y + 5, WIDTH, 14))
+
+    for x in range(-20, WIDTH + 20, 28):
+        gx = x - int(scroll) % 28
+        pygame.draw.line(screen, (47, 143, 45), (gx, ground_y + 28), (gx + 18, ground_y + 5), 4)
+
+    pygame.draw.rect(screen, DIRT, (0, ground_y + 34, WIDTH, GROUND_HEIGHT - 34))
+
+
+def draw_pipe(rect, top=True):
+    pygame.draw.rect(screen, PIPE_DARK, rect)
+    pygame.draw.rect(screen, PIPE, rect.inflate(-8, 0))
+    pygame.draw.line(screen, (177, 242, 125), (rect.x + 18, rect.y), (rect.x + 18, rect.bottom), 4)
+
+    lip_y = rect.bottom - 20 if top else rect.y
+    lip = pygame.Rect(rect.x - 10, lip_y, rect.w + 20, 24)
+    pygame.draw.rect(screen, PIPE_DARK, lip, border_radius=5)
+    pygame.draw.rect(screen, PIPE, lip.inflate(-6, -5), border_radius=4)
+
+
+def draw_pipes():
+    for pipe in game["pipes"]:
+        draw_pipe(pipe["top"], True)
+        draw_pipe(pipe["bottom"], False)
+
+
+def draw_coin(rect):
+    pulse = int(3 * abs(pygame.math.Vector2(1, 0).rotate(pygame.time.get_ticks() * 0.15).x))
+    coin = rect.inflate(pulse, pulse)
+
+    pygame.draw.ellipse(screen, (0, 0, 0, 70), coin.move(4, 5))
+    pygame.draw.ellipse(screen, GOLD_DARK, coin)
+    pygame.draw.ellipse(screen, GOLD, coin.inflate(-7, -7))
+    pygame.draw.ellipse(screen, (255, 246, 150), coin.inflate(-18, -16))
+    pygame.draw.line(screen, GOLD_DARK, (coin.centerx, coin.y + 9), (coin.centerx, coin.bottom - 9), 3)
+
+
+def draw_coins():
+    for pipe in game["pipes"]:
+        if not pipe["coin_collected"]:
+            draw_coin(pipe["coin"])
+
+
+def draw_bird():
+    rect = bird_rect()
+    sprite = get_skin(selected_skin, (64, 48))
+    angle = max(-25, min(20, -game["velocity"] * 3))
+    rotated = pygame.transform.rotozoom(sprite, angle, 1)
+    screen.blit(rotated, rotated.get_rect(center=rect.center))
+
+
+def draw_hud():
+    score_text = big_font.render(str(game["score"]), True, WHITE)
+    screen.blit(score_text, score_text.get_rect(center=(WIDTH // 2, 70)))
+
+    hud = pygame.Surface((310, 82), pygame.SRCALPHA)
+    pygame.draw.rect(hud, (10, 25, 30, 190), hud.get_rect(), border_radius=12)
+    pygame.draw.rect(hud, (255, 255, 255, 40), hud.get_rect(), 2, border_radius=12)
+    screen.blit(hud, (20, 20))
+
+    coins = font.render(f"Coins: {game['coins']}   Bank: {total_coins}", True, GOLD)
+    best = small_font.render(f"Best: {high_score}   Skin: {SKINS[selected_skin]['name']}", True, WHITE)
+    screen.blit(coins, (40, 34))
+    screen.blit(best, (40, 66))
+
+
+def draw_center(title, subtitle, color):
+    title_s = title_font.render(title, True, color)
+    title_shadow = title_font.render(title, True, BLACK)
+    sub_s = font.render(subtitle, True, BLACK)
+
+    screen.blit(title_shadow, title_shadow.get_rect(center=(WIDTH // 2 + 4, 220 + 4)))
+    screen.blit(title_s, title_s.get_rect(center=(WIDTH // 2, 220)))
+    screen.blit(sub_s, sub_s.get_rect(center=(WIDTH // 2, 310)))
+
+
+def draw_shop():
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((5, 15, 22, 155))
+    screen.blit(overlay, (0, 0))
+
+    panel = pygame.Rect(WIDTH // 2 - 350, 82, 700, 500)
+    pygame.draw.rect(screen, (18, 45, 52), panel, border_radius=14)
+    pygame.draw.rect(screen, (140, 235, 174), panel, 3, border_radius=14)
+
+    title = big_font.render("SKIN SHOP", True, WHITE)
+    bank = font.render(f"Bank Coins: {total_coins}", True, GOLD)
+    screen.blit(title, title.get_rect(center=(WIDTH // 2, 125)))
+    screen.blit(bank, bank.get_rect(center=(WIDTH // 2, 168)))
+
+    skin = SKINS[preview_skin]
+    preview = get_skin(preview_skin, (170, 128))
+    screen.blit(preview, preview.get_rect(center=(WIDTH // 2, 285)))
+
+    name = big_font.render(skin["name"], True, WHITE)
+    screen.blit(name, name.get_rect(center=(WIDTH // 2, 380)))
+
+    if preview_skin == selected_skin:
+        status = "Equipped"
+        color = (135, 245, 162)
+    elif preview_skin in unlocked_skins:
+        status = "Press ENTER to equip"
+        color = WHITE
+    else:
+        status = f"Press ENTER to buy - {skin['price']} coins"
+        color = GOLD if total_coins >= skin["price"] else RED
+
+    status_s = font.render(status, True, color)
+    screen.blit(status_s, status_s.get_rect(center=(WIDTH // 2, 425)))
+
+    left = big_font.render("<", True, WHITE)
+    right = big_font.render(">", True, WHITE)
+    screen.blit(left, left.get_rect(center=(panel.x + 80, 285)))
+    screen.blit(right, right.get_rect(center=(panel.right - 80, 285)))
+
+    footer = small_font.render("LEFT/RIGHT choose   ENTER buy/equip   I import assets_hd/custom_skin.png   ESC back", True, WHITE)
+    screen.blit(footer, footer.get_rect(center=(WIDTH // 2, 535)))
+
+
+def update_game():
+    global total_coins, high_score
+
+    game["velocity"] += GRAVITY
+    game["bird_y"] += game["velocity"]
+
+    if game["score"] >= 25:
+        game["speed"] = 6
+    elif game["score"] >= 10:
+        game["speed"] = 5
+    else:
+        game["speed"] = PIPE_SPEED_START
+
+    for pipe in game["pipes"]:
+        pipe["top"].x -= game["speed"]
+        pipe["bottom"].x -= game["speed"]
+        pipe["coin"].x -= game["speed"]
+
+        if not pipe["scored"] and pipe["top"].right < BIRD_X:
+            pipe["scored"] = True
+            game["score"] += 1
+
+        if not pipe["coin_collected"] and bird_rect().inflate(-10, -10).colliderect(pipe["coin"]):
+            pipe["coin_collected"] = True
+            game["coins"] += 1
+            total_coins += 1
+            game["score"] += 2
+            save_game()
+
+    if game["pipes"][0]["top"].right < 0:
+        game["pipes"].pop(0)
+        game["pipes"].append(create_pipe(game["pipes"][-1]["top"].x + PIPE_DISTANCE))
+
+    hitbox = bird_rect().inflate(-12, -10)
+
+    if hitbox.top <= 0 or hitbox.bottom >= HEIGHT - GROUND_HEIGHT:
+        game["state"] = GAME_OVER
+        high_score = max(high_score, game["score"])
+
+    for pipe in game["pipes"]:
+        if hitbox.colliderect(pipe["top"]) or hitbox.colliderect(pipe["bottom"]):
+            game["state"] = GAME_OVER
+            high_score = max(high_score, game["score"])
+
+
+def draw():
+    draw_background(ground_scroll)
+
+    if game["state"] != SHOP:
+        draw_pipes()
+        draw_coins()
+        draw_bird()
+
+    draw_hud()
+
+    if game["state"] == MENU:
+        draw_center("FLAPPY BIRD", "SPACE / UP / CLICK to start    S for shop", BLACK)
+    elif game["state"] == GAME_OVER:
+        draw_center("GAME OVER", "SPACE / CLICK to restart    ESC for menu", RED)
+        final_s = font.render(f"Final Score: {game['score']}   Coins Collected: {game['coins']}", True, BLACK)
+        screen.blit(final_s, final_s.get_rect(center=(WIDTH // 2, 380)))
+    elif game["state"] == SHOP:
+        draw_shop()
+
+
+total_coins, selected_skin, unlocked_skins = load_save()
+preview_skin = selected_skin
+high_score = 0
+ground_scroll = 0
+game = menu_game()
+running = True
+
+while running:
+    clock.tick(FPS)
+    ground_scroll = (ground_scroll + game["speed"] * 0.8) % 1000
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+
+        elif game["state"] == MENU:
+            if flap_input(event):
+                game = new_game()
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_s:
+                game["state"] = SHOP
+
+        elif game["state"] == RUNNING:
+            if flap_input(event):
+                game["velocity"] = FLAP_FORCE
+
+        elif game["state"] == GAME_OVER:
+            if flap_input(event):
+                game = new_game()
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                game = menu_game()
+
+        elif game["state"] == SHOP and event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                game = menu_game()
+            elif event.key in (pygame.K_LEFT, pygame.K_a):
+                preview_skin = (preview_skin - 1) % len(SKINS)
+            elif event.key in (pygame.K_RIGHT, pygame.K_d):
+                preview_skin = (preview_skin + 1) % len(SKINS)
+            elif event.key == pygame.K_i:
+                import_custom_skin()
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                skin = SKINS[preview_skin]
+
+                if preview_skin in unlocked_skins:
+                    selected_skin = preview_skin
+                    save_game()
+                elif total_coins >= skin["price"]:
+                    total_coins -= skin["price"]
+                    unlocked_skins.add(preview_skin)
+                    selected_skin = preview_skin
+                    save_game()
+
+    if game["state"] == RUNNING:
+        update_game()
+
+    draw()
+    pygame.display.flip()
+
+pygame.quit()
+sys.exit()
